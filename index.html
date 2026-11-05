@@ -186,10 +186,18 @@
         pub.readContract({ address: c.vault, abi: VAULT, functionName: 'isFrozen' }),
         pub.readContract({ address: c.commitment, abi: COMMITMENT, functionName: 'lastBatchId' }),
       ]);
-      // the vault only accepts the LAST proof: fetch it if this data is older
-      if (Number(last) !== snap.batchId && source) {
-        const base = source.replace(/latest\.json(\?.*)?$/, '');
-        try { setData(await loadFrom(`${base}batches/${Number(last)}.json`), source); return checkVault(c, card, status, table); } catch { /* keep going: report below */ }
+      // the vault only accepts the LAST proof: if this data (online or a saved file) is older, fetch that proof's data
+      // from where the data came from, else from next to this page (GitHub) or the exchange
+      if (Number(last) !== snap.batchId) {
+        const bases = [...new Set([source && source.replace(/latest\.json(\?.*)?$/, ''), './', 'https://api.rtcbit.com/api/escape/'].filter(Boolean))];
+        for (const base of bases) {
+          try {
+            setData(await loadFrom(`${base}batches/${Number(last)}.json`), `${base}batches/${Number(last)}.json`);
+            return checkVault(c, card, status, table);
+          } catch {
+            /* next place */
+          }
+        }
       }
       if (Number(last) !== snap.batchId) {
         status.textContent = `This data is proof #${snap.batchId}, but the vault's last proof is #${last}. Load the data for proof #${last}.`;
