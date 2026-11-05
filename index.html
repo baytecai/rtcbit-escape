@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RTCBIT — Emergency withdrawal</title>
+<!--
+  RTCBIT escape page. Works on its own from ANY host (GitHub Pages, IPFS, a local file): it needs only the escape data
+  (latest.json, published by the exchange for every balance proof) and the user's wallet (MetaMask).
+  When the exchange has not posted a balance proof for 7 days, each vault FREEZES and every user can withdraw their own
+  balance from the last proof — this page calls the vault's emergencyWithdraw / reclaimDeposit for them.
+-->
+<style>
+  :root { --bg: #07090a; --card: #0f1312; --line: rgba(255,255,255,.1); --text: #fff; --muted: rgba(255,255,255,.75); --lime: #b3f141; --red: #f0475b; --amber: #f0b90b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 28px 16px 60px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 17px; margin: 0 0 10px; }
+  p { color: var(--muted); margin: 0 0 10px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button, label.btn { font: inherit; cursor: pointer; border-radius: 8px; padding: 9px 16px; border: 1px solid var(--line); background: #1a201e; color: var(--text); }
+  button.primary { background: var(--lime); color: #0a0f05; border-color: var(--lime); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  code { font-family: ui-monospace, monospace; font-size: 13px; color: var(--muted); word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  .ok { color: var(--lime); } .bad { color: var(--red); } .warn { color: var(--amber); }
+  .msg { margin-top: 8px; font-size: 14px; }
+  input[type=file] { display: none; }
+  ol { color: var(--muted); padding-left: 20px; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Emergency withdrawal</h1>
+  <p>If RTCBIT stops working, your money is still in the vault smart contracts on the blockchain. After 7 days without a new balance proof, each vault <b>freezes</b> and you can take <b>your own balance</b> out yourself — no permission from the exchange is needed.</p>
+  <ol>
+    <li>The escape data loads automatically (or load the file you downloaded from RTCBIT).</li>
+    <li>Connect the wallet you used on RTCBIT.</li>
+    <li>For each network, check the vault and press <b>Withdraw</b>. The coins go straight to your wallet.</li>
+  </ol>
+
+  <div class="card">
+    <h2>1. Escape data</h2>
+    <div class="row">
+      <span id="dataStatus">Loading…</span>
+      <label class="btn" for="file">Load my escape file</label>
+      <input id="file" type="file" accept="application/json,.json" />
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Your wallet</h2>
+    <div class="row">
+      <button id="connect" class="primary">Connect wallet</button>
+      <span id="account"></span>
+    </div>
+  </div>
+
+  <div id="chains"></div>
+  <p style="font-size:13px">Each balance can be withdrawn once per proof. Deposits made after the last proof can be taken back with "Reclaim". Network fees (gas) are paid by your wallet.</p>
+</main>
+
+<script type="module">
+  import { createPublicClient, createWalletClient, custom, parseAbi, parseAbiItem, formatUnits } from 'https://cdn.jsdelivr.net/npm/viem@2.21.0/+esm';
+
+  const VAULT = parseAbi([
+    'function isFrozen() view returns (bool)',
+    'function exitDelay() view returns (uint256)',
+    'function exitedAt(address account, address token) view returns (uint256)',
+    'function depositHash(uint256 id) view returns (bytes32)',
+    'function emergencyWithdraw(address token, string currency, uint256 amount18, bytes32[] proof)',
+    'function reclaimDeposit(uint256 depositId, address account, address token, uint256 amount, uint256 watermark, bytes32[] proof)',
+  ]);
+  const COMMITMENT = parseAbi(['function lastBatchId() view returns (uint256)', 'function postedAt(uint256 batchId) view returns (uint64)']);
+  const DEPOSITED = parseAbiItem('event Deposited(uint256 indexed depositId, address indexed account, address indexed token, uint256 amount, address from)');
+  const NATIVE = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+
+  // where the escape data may be: next to this page (GitHub Pages mirror), ?data=<url>, or the exchange's own API
+  const params = new URLSearchParams(location.search);
+  const SOURCES = [params.get('data'), './latest.json', 'https://api.rtcbit.com/api/escape/latest.json', location.hostname === 'localhost' ? 'http://localhost:4400/api/escape/latest.json' : null].filter(Boolean);
+
+  let snap = null;      // the escape data
+  let source = null;    // the URL it came from (to find other batches next to it)
+  let account = null;
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
+
+  function setData(s, from) {
+    if (s?.kind !== 'rtcbit-escape' || !Array.isArray(s.chains)) throw new Error('this is not an RTCBIT escape file');
+    snap = s;
+    source = from;
+    $('dataStatus').textContent = `Proof #${s.batchId} · ${new Date(s.createdAt).toLocaleString()} · ${from ? 'from ' + from : 'from your file'}`;
+    $('dataStatus').className = 'ok';
+    render();
+  }
+
+  async function loadFrom(url) {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.json();
+  }
+
+  (async () => {
+    for (const url of SOURCES) {
+      try { return setData(await loadFrom(url), url); } catch { /* next source */ }
+    }
+    $('dataStatus').textContent = 'No escape data found online — load the escape file you downloaded from RTCBIT.';
+    $('dataStatus').className = 'warn';
+  })();
+
+  $('file').addEventListener('change', async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try { setData(JSON.parse(await f.text()), null); } catch (err) { alert(err.message); }
+  });
+
+  $('connect').addEventListener('click', async () => {
+    if (!window.ethereum) return alert('No wallet found. Install MetaMask (or open this page in your wallet app).');
+    const [a] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    account = a.toLowerCase();
+    $('account').textContent = a;
+    window.ethereum.on?.('accountsChanged', (x) => { account = x[0]?.toLowerCase() || null; $('account').textContent = x[0] || ''; render(); });
+    render();
+  });
+
+  async function useChain(c) {
+    const hex = '0x' + c.chainId.toString(16);
+    if ((await window.ethereum.request({ method: 'eth_chainId' })) !== hex) {
+      try {
+        await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hex }] });
+      } catch (e) {
+        throw new Error(e.code === 4902 ? `Add the ${c.name} network (chain id ${c.chainId}) to your wallet first.` : (e.message || 'network switch refused'));
+      }
+    }
+    const chain = { id: c.chainId, name: c.name, nativeCurrency: { name: c.native, symbol: c.native, decimals: 18 }, rpcUrls: { default: { http: [] } } };
+    return {
+      pub: createPublicClient({ chain, transport: custom(window.ethereum) }),
+      wallet: createWalletClient({ chain, account, transport: custom(window.ethereum) }),
+    };
+  }
+
+  const tokenInfo = (c, token) => c.tokens?.[token] || (token === NATIVE ? { symbol: c.native, decimals: 18 } : { symbol: token.slice(0, 8) + '…', decimals: 18 });
+  const human = (amount18) => Number(formatUnits(BigInt(amount18), 18)).toLocaleString('en-US', { maximumFractionDigits: 8 });
+
+  function render() {
+    const box = $('chains');
+    box.textContent = '';
+    if (!snap) return;
+    for (const c of snap.chains) {
+      const card = el('div', undefined, 'card');
+      card.append(el('h2', `3. ${c.name}`));
+      const mine = account ? (snap.accounts[account] || []).filter((x) => x.chainId === c.chainId) : [];
+      if (!account) card.append(el('p', 'Connect your wallet to see your balance here.'));
+      else if (!mine.length) card.append(el('p', 'No balance of yours on this network in this proof.'));
+      const status = el('div', '', 'msg');
+      const table = el('table');
+      if (mine.length) {
+        const head = el('tr'); ['Coin', 'Amount', ''].forEach((h) => head.append(el('th', h))); table.append(head);
+        for (const x of mine) {
+          const tr = el('tr');
+          tr.append(el('td', tokenInfo(c, x.token).symbol), el('td', human(x.amount18)));
+          const td = el('td'); const btn = el('button', 'Withdraw', 'primary'); btn.disabled = true; btn.dataset.token = x.token; td.append(btn); tr.append(td);
+          btn.onclick = () => withdraw(c, x, btn, status);
+          table.append(tr);
+        }
+        card.append(table);
+      }
+      const check = el('button', 'Check this vault');
+      check.onclick = () => checkVault(c, card, status, table);
+      const row = el('div', undefined, 'row'); row.append(check);
+      card.append(row, status);
+      box.append(card);
+    }
+  }
+
+  async function checkVault(c, card, status, table) {
+    if (!account) return alert('Connect your wallet first.');
+    status.textContent = 'Checking…'; status.className = 'msg';
+    try {
+      const { pub } = await useChain(c);
+      const [frozen, last] = await Promise.all([
+        pub.readContract({ address: c.vault, abi: VAULT, functionName: 'isFrozen' }),
+        pub.readContract({ address: c.commitment, abi: COMMITMENT, functionName: 'lastBatchId' }),
+      ]);
+      // the vault only accepts the LAST proof: fetch it if this data is older
+      if (Number(last) !== snap.batchId && source) {
+        const base = source.replace(/latest\.json(\?.*)?$/, '');
+        try { setData(await loadFrom(`${base}batches/${Number(last)}.json`), source); return checkVault(c, card, status, table); } catch { /* keep going: report below */ }
+      }
+      if (Number(last) !== snap.batchId) {
+        status.textContent = `This data is proof #${snap.batchId}, but the vault's last proof is #${last}. Load the data for proof #${last}.`;
+        status.className = 'msg bad';
+        return;
+      }
+      for (const btn of table.querySelectorAll('button[data-token]')) {
+        const done = await pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitedAt', args: [account, btn.dataset.token] });
+        btn.disabled = !frozen || Number(done) === snap.batchId;
+        if (Number(done) === snap.batchId) btn.textContent = 'Withdrawn ✓';
+      }
+      if (!frozen) {
+        status.textContent = 'The vault is working normally (not frozen): withdraw on rtcbit.com as usual. Emergency withdrawal opens only after 7 days without a new proof.';
+        status.className = 'msg warn';
+        return;
+      }
+      status.textContent = 'The vault is FROZEN — you can withdraw your balance. Looking for deposits made after the last proof…';
+      status.className = 'msg ok';
+      await findReclaims(c, pub, card, status);
+    } catch (e) {
+      status.textContent = e.shortMessage || e.message; status.className = 'msg bad';
+    }
+  }
+
+  async function withdraw(c, x, btn, status) {
+    btn.disabled = true; btn.textContent = 'Confirm in wallet…';
+    try {
+      const { pub, wallet } = await useChain(c);
+      const hash = await wallet.writeContract({ address: c.vault, abi: VAULT, functionName: 'emergencyWithdraw', args: [x.token, x.currency, BigInt(x.amount18), x.proof] });
+      btn.textContent = 'Sending…';
+      await pub.waitForTransactionReceipt({ hash });
+      btn.textContent = 'Withdrawn ✓';
+      status.textContent = `Done — sent to your wallet. Transaction ${hash}`; status.className = 'msg ok';
+    } catch (e) {
+      btn.disabled = false; btn.textContent = 'Withdraw';
+      status.textContent = e.shortMessage || e.message; status.className = 'msg bad';
+    }
+  }
+
+  // deposits made after the last proof are not in it: the vault gives them back to their owner
+  async function findReclaims(c, pub, card, status) {
+    const mark = snap.deposits?.[String(c.chainId)];
+    if (!mark) return (status.textContent += ' (no deposit data for this network)');
+    const latest = await pub.getBlockNumber();
+    const found = [];
+    const STEP = 49_999n;
+    for (let from = BigInt(c.startBlock || 0); from <= latest; from += STEP + 1n) {
+      const to = from + STEP > latest ? latest : from + STEP;
+      const logs = await pub.getLogs({ address: c.vault, event: DEPOSITED, args: { account }, fromBlock: from, toBlock: to });
+      for (const l of logs) if (l.args.depositId > BigInt(mark.watermark)) found.push(l.args);
+    }
+    const open = [];
+    for (const d of found) {
+      const h = await pub.readContract({ address: c.vault, abi: VAULT, functionName: 'depositHash', args: [d.depositId] });
+      if (BigInt(h) !== 0n) open.push(d);
+    }
+    status.textContent = open.length ? `The vault is FROZEN — you can withdraw. ${open.length} deposit(s) made after the last proof can be reclaimed:` : 'The vault is FROZEN — you can withdraw your balance above.';
+    for (const d of open) {
+      const t = tokenInfo(c, d.token.toLowerCase());
+      const row = el('div', undefined, 'row');
+      row.append(el('span', `Deposit #${d.depositId}: ${formatUnits(d.amount, t.decimals)} ${t.symbol}`));
+      const b = el('button', 'Reclaim', 'primary');
+      b.onclick = async () => {
+        b.disabled = true; b.textContent = 'Confirm in wallet…';
+        try {
+          const { wallet } = await useChain(c);
+          const hash = await wallet.writeContract({ address: c.vault, abi: VAULT, functionName: 'reclaimDeposit', args: [d.depositId, d.account, d.token, d.amount, BigInt(mark.watermark), mark.proof] });
+          await pub.waitForTransactionReceipt({ hash });
+          b.textContent = 'Reclaimed ✓';
+        } catch (e) { b.disabled = false; b.textContent = 'Reclaim'; alert(e.shortMessage || e.message); }
+      };
+      row.append(b);
+      card.append(row);
+    }
+  }
+</script>
+</body>
+</html>
