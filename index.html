@@ -70,9 +70,9 @@
   const VAULT = parseAbi([
     'function isFrozen() view returns (bool)',
     'function exitDelay() view returns (uint256)',
-    'function exitedAt(address account, address token) view returns (uint256)',
+    'function claimable(address account, address token, uint256 amount18, uint256 paid) view returns (uint256)',
     'function depositHash(uint256 id) view returns (bytes32)',
-    'function emergencyWithdraw(address token, string currency, uint256 amount18, bytes32[] proof)',
+    'function emergencyWithdraw(address token, string currency, uint256 amount18, uint256 paid, bytes32[] proof)',
     'function reclaimDeposit(uint256 depositId, address account, address token, uint256 amount, uint256 watermark, bytes32[] proof)',
   ]);
   const COMMITMENT = parseAbi(['function lastBatchId() view returns (uint256)', 'function postedAt(uint256 batchId) view returns (uint64)']);
@@ -163,7 +163,7 @@
         for (const x of mine) {
           const tr = el('tr');
           tr.append(el('td', tokenInfo(c, x.token).symbol), el('td', human(x.amount18)));
-          const td = el('td'); const btn = el('button', 'Withdraw', 'primary'); btn.disabled = true; btn.dataset.token = x.token; td.append(btn); tr.append(td);
+          const td = el('td'); const btn = el('button', 'Withdraw', 'primary'); btn.disabled = true; btn.dataset.token = x.token; btn.dataset.amount = x.amount18; btn.dataset.paid = x.paid || '0'; td.append(btn); tr.append(td);
           btn.onclick = () => withdraw(c, x, btn, status);
           table.append(tr);
         }
@@ -204,10 +204,11 @@
         status.className = 'msg bad';
         return;
       }
+      // what the vault would pay now: the proof's amount minus anything it paid you after the proof (or already claimed)
       for (const btn of table.querySelectorAll('button[data-token]')) {
-        const done = await pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitedAt', args: [account, btn.dataset.token] });
-        btn.disabled = !frozen || Number(done) === snap.batchId;
-        if (Number(done) === snap.batchId) btn.textContent = 'Withdrawn ✓';
+        const left = await pub.readContract({ address: c.vault, abi: VAULT, functionName: 'claimable', args: [account, btn.dataset.token, BigInt(btn.dataset.amount), BigInt(btn.dataset.paid)] });
+        btn.disabled = !frozen || left === 0n;
+        if (left === 0n) btn.textContent = 'Nothing left ✓';
       }
       if (!frozen) {
         status.textContent = 'The vault is working normally (not frozen): withdraw on rtcbit.com as usual. Emergency withdrawal opens only after 7 days without a new proof.';
@@ -226,7 +227,7 @@
     btn.disabled = true; btn.textContent = 'Confirm in wallet…';
     try {
       const { pub, wallet } = await useChain(c);
-      const hash = await wallet.writeContract({ address: c.vault, abi: VAULT, functionName: 'emergencyWithdraw', args: [x.token, x.currency, BigInt(x.amount18), x.proof] });
+      const hash = await wallet.writeContract({ address: c.vault, abi: VAULT, functionName: 'emergencyWithdraw', args: [x.token, x.currency, BigInt(x.amount18), BigInt(x.paid || '0'), x.proof] });
       btn.textContent = 'Sending…';
       await pub.waitForTransactionReceipt({ hash });
       btn.textContent = 'Withdrawn ✓';
