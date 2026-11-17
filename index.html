@@ -70,6 +70,8 @@
   const VAULT = parseAbi([
     'function isFrozen() view returns (bool)',
     'function exitDelay() view returns (uint256)',
+    'function exitStartedAt() view returns (uint256)',
+    'function exitBatchId() view returns (uint256)',
     'function claimable(address account, address token, uint256 amount18, uint256 paid) view returns (uint256)',
     'function depositHash(uint256 id) view returns (bytes32)',
     'function emergencyWithdraw(address token, string currency, uint256 amount18, uint256 paid, bytes32[] proof)',
@@ -182,11 +184,15 @@
     status.textContent = 'Checking…'; status.className = 'msg';
     try {
       const { pub } = await useChain(c);
-      const [frozen, last] = await Promise.all([
+      const [frozen, lastPosted, exitAt, exitBatch] = await Promise.all([
         pub.readContract({ address: c.vault, abi: VAULT, functionName: 'isFrozen' }),
         pub.readContract({ address: c.commitment, abi: COMMITMENT, functionName: 'lastBatchId' }),
+        pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitStartedAt' }).catch(() => 0n), // older vaults: no exit mode
+        pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitBatchId' }).catch(() => 0n),
       ]);
-      // the vault only accepts the LAST proof: if this data (online or a saved file) is older, fetch that proof's data
+      // in exit mode the vault pays from the proof it pinned when the first claim was made, whatever was posted later
+      const last = exitAt > 0n ? exitBatch : lastPosted;
+      // the vault only accepts ITS proof: if this data (online or a saved file) is another one, fetch that proof's data
       // from where the data came from, else from next to this page (GitHub) or the exchange
       if (Number(last) !== snap.batchId) {
         const bases = [...new Set([source && source.replace(/latest\.json(\?.*)?$/, ''), './', 'https://api.rtcbit.com/api/escape/'].filter(Boolean))];
