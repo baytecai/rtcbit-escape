@@ -8,7 +8,8 @@
   RTCBIT escape page. Works on its own from ANY host (GitHub Pages, IPFS, a local file): it needs only the escape data
   (latest.json, published by the exchange for every balance proof) and the user's wallet (MetaMask).
   When the exchange has not posted a balance proof for 7 days, each vault FREEZES and every user can withdraw their own
-  balance from the last proof — this page calls the vault's emergencyWithdraw / reclaimDeposit for them.
+  balance from the last proof — this page calls the vault's startExitMode, then (2 days later) emergencyWithdraw /
+  reclaimDeposit for them.
 -->
 <style>
   :root { --bg: #07090a; --card: #0f1312; --line: rgba(255,255,255,.1); --text: #fff; --muted: rgba(255,255,255,.75); --lime: #b3f141; --red: #f0475b; --amber: #f0b90b; }
@@ -72,6 +73,8 @@
     'function exitDelay() view returns (uint256)',
     'function exitStartedAt() view returns (uint256)',
     'function exitBatchId() view returns (uint256)',
+    'function claimsOpenAt() view returns (uint256)',
+    'function startExitMode()',
     'function claimable(address account, address token, uint256 amount18, uint256 paid) view returns (uint256)',
     'function depositHash(uint256 id) view returns (bytes32)',
     'function emergencyWithdraw(address token, string currency, uint256 amount18, uint256 paid, bytes32[] proof)',
@@ -184,13 +187,19 @@
     status.textContent = 'Checking…'; status.className = 'msg';
     try {
       const { pub } = await useChain(c);
-      const [frozen, lastPosted, exitAt, exitBatch] = await Promise.all([
+      const [frozen, lastPosted, exitAt, exitBatch, claimsAt] = await Promise.all([
         pub.readContract({ address: c.vault, abi: VAULT, functionName: 'isFrozen' }),
         pub.readContract({ address: c.commitment, abi: COMMITMENT, functionName: 'lastBatchId' }),
         pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitStartedAt' }).catch(() => 0n), // older vaults: no exit mode
         pub.readContract({ address: c.vault, abi: VAULT, functionName: 'exitBatchId' }).catch(() => 0n),
+        pub.readContract({ address: c.vault, abi: VAULT, functionName: 'claimsOpenAt' }).catch(() => null), // older vaults: claims at once
       ]);
-      // in exit mode the vault pays from the proof it pinned when the first claim was made, whatever was posted later
+      // newer vaults: exit mode is started first (anyone, one transaction), claims open a set time later (2 days —
+      // the exchange's admin can still correct a wrong proof in that time)
+      const stepped = claimsAt !== null;
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const claimsOpen = !stepped || (exitAt > 0n && now >= claimsAt);
+      // in exit mode the vault pays from the proof it pinned when exit mode started, whatever was posted later
       const last = exitAt > 0n ? exitBatch : lastPosted;
       // the vault only accepts ITS proof: if this data (online or a saved file) is another one, fetch that proof's data
       // from where the data came from, else from next to this page (GitHub) or the exchange
@@ -213,11 +222,33 @@
       // what the vault would pay now: the proof's amount minus anything it paid you after the proof (or already claimed)
       for (const btn of table.querySelectorAll('button[data-token]')) {
         const left = await pub.readContract({ address: c.vault, abi: VAULT, functionName: 'claimable', args: [account, btn.dataset.token, BigInt(btn.dataset.amount), BigInt(btn.dataset.paid)] });
-        btn.disabled = !frozen || left === 0n;
+        btn.disabled = !frozen || !claimsOpen || left === 0n;
         if (left === 0n) btn.textContent = 'Nothing left ✓';
       }
       if (!frozen) {
         status.textContent = 'The vault is working normally (not frozen): withdraw on rtcbit.com as usual. Emergency withdrawal opens only after 7 days without a new proof.';
+        status.className = 'msg warn';
+        return;
+      }
+      if (stepped && exitAt === 0n) {
+        status.textContent = 'The vault is FROZEN. Step 1: start exit mode (one transaction — anyone can do it). Withdrawals open 2 days after that.';
+        status.className = 'msg warn';
+        const b = el('button', 'Start exit mode', 'primary');
+        b.onclick = async () => {
+          b.disabled = true; b.textContent = 'Confirm in wallet…';
+          try {
+            const { wallet } = await useChain(c);
+            const hash = await wallet.writeContract({ address: c.vault, abi: VAULT, functionName: 'startExitMode' });
+            await pub.waitForTransactionReceipt({ hash });
+            b.textContent = 'Exit mode started ✓';
+            checkVault(c, card, status, table);
+          } catch (e) { b.disabled = false; b.textContent = 'Start exit mode'; alert(e.shortMessage || e.message); }
+        };
+        card.append(b);
+        return;
+      }
+      if (!claimsOpen) {
+        status.textContent = `Exit mode is on. Withdrawals open on ${new Date(Number(claimsAt) * 1000).toLocaleString()} — come back then (the waiting time lets the exchange correct a wrong proof before anything is paid).`;
         status.className = 'msg warn';
         return;
       }
